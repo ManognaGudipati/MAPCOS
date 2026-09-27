@@ -8,7 +8,12 @@ import cv2
 import numpy as np
 import tensorflow as tf
 
-
+def heatmap_to_mask(heatmap, target_shape, threshold=0.5):
+    """Resizes the Grad-CAM heatmap to target_shape and binarizes it,
+    so it can be compared against the follicle mask via IoU."""
+    resized = cv2.resize(heatmap, (target_shape[1], target_shape[0]))
+    return (resized >= threshold).astype(np.uint8)
+    
 def make_gradcam_heatmap(img_array, model, last_conv_layer_name="efficientnetb0"):
     """Returns a 2D float array in [0, 1]."""
     base_model = model.get_layer(last_conv_layer_name)
