@@ -15,3 +15,13 @@ LAST_CONV_LAYER = "efficientnetb0"
 
 PCOM_THRESHOLD = 20            # Rotterdam PCOM: >=20 follicles per ovary
 ROTTERDAM_CRITERIA_COUNT = 2   # 2-of-3 rule
+
+# Follicle Counting Agent — Hough Circle params
+HOUGH_PARAMS = {
+    "dp": 1.2,
+    "min_dist": 15,
+    "param1": 50,
+    "param2": 25,
+    "min_radius": 3,
+    "max_radius": 25,
+}
