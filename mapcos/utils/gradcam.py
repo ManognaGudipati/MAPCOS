@@ -10,13 +10,26 @@ import tensorflow as tf
 
 
 def make_gradcam_heatmap(img_array, model, last_conv_layer_name="efficientnetb0"):
-    """Returns a 2D float array in [0, 1], same H×W as the conv layer's output."""
-    grad_model = tf.keras.models.Model(
-        [model.inputs], [model.get_layer(last_conv_layer_name).output, model.output]
-    )
+    """Returns a 2D float array in [0, 1]."""
+    base_model = model.get_layer(last_conv_layer_name)
+
+    # Model #1: input -> backbone's feature map output
+    last_conv_layer_model = tf.keras.Model(base_model.input, base_model.output)
+
+    # Model #2: feature map -> everything after the backbone (GAP, dropout, dense...)
+    classifier_input = tf.keras.Input(shape=base_model.output.shape[1:])
+    x = classifier_input
+    base_index = model.layers.index(base_model)
+    for layer in model.layers[base_index + 1:]:
+        x = layer(x)
+    classifier_model = tf.keras.Model(classifier_input, x)
+
     with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(img_array)
+        conv_outputs = last_conv_layer_model(img_array)
+        tape.watch(conv_outputs)
+        predictions = classifier_model(conv_outputs)
         loss = predictions[:, 0]
+
     grads = tape.gradient(loss, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
     conv_outputs = conv_outputs[0]
