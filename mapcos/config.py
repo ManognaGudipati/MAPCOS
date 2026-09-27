@@ -38,3 +38,8 @@ FOLLICLE_PARAMS = {
     "min_circularity": 0.4,         # loosened from 0.45 — same reason
     "border_margin": 3,             # drops crop-edge artifacts
 }
+# Agreement / Grounding Agent
+GROUNDING_PARAMS = {
+    "heatmap_threshold": 0.5,      # Grad-CAM value above which a pixel counts as "CNN attention"
+    "iou_agreement_threshold": 0.15,  # IoU rarely gets high here — Grad-CAM is diffuse, follicles are small circles
+}
