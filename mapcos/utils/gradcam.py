@@ -11,8 +11,25 @@ import tensorflow as tf
 
 def make_gradcam_heatmap(img_array, model, last_conv_layer_name="top_conv"):
     """Returns a 2D float array in [0, 1], same H×W as the conv layer's output."""
+    try:
+        conv_layer = model.get_layer(last_conv_layer_name)
+    except ValueError:
+        conv_layer = None
+        for layer in model.layers:
+            if hasattr(layer, "get_layer"):
+                try:
+                    conv_layer = layer.get_layer(last_conv_layer_name)
+                    break
+                except ValueError:
+                    continue
+        if conv_layer is None:
+            raise ValueError(
+                f"Could not find layer '{last_conv_layer_name}' at the top level "
+                f"or inside any nested submodel."
+            )
+
     grad_model = tf.keras.models.Model(
-        [model.inputs], [model.get_layer(last_conv_layer_name).output, model.output]
+        [model.inputs], [conv_layer.output, model.output]
     )
     with tf.GradientTape() as tape:
         conv_outputs, predictions = grad_model(img_array)
