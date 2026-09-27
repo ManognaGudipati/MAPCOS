@@ -25,3 +25,16 @@ HOUGH_PARAMS = {
     "min_radius": 3,
     "max_radius": 25,
 }
+
+# Follicle Counting Agent — watershed segmentation params
+FOLLICLE_PARAMS = {
+    "crop_fraction": 0.88,          # keeps top 88% of the image, drops the flat annotation bar
+    "bilateral_d": 9,
+    "bilateral_sigma_color": 75,
+    "bilateral_sigma_space": 75,
+    "min_peak_distance": 9,         # merges near-duplicate detections
+    "min_area": 15,                 # loosened from 20 — was rejecting real small follicles
+    "max_area": 500,
+    "min_circularity": 0.4,         # loosened from 0.45 — same reason
+    "border_margin": 3,             # drops crop-edge artifacts
+}
