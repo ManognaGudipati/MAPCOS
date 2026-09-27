@@ -6,3 +6,5 @@ scikit-learn
 xgboost
 neo4j
 matplotlib
+scikit-image
+scipy
