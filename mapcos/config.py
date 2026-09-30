@@ -8,7 +8,7 @@ IMG_SIZE = 224
 BATCH_SIZE = 32
 
 DATA_DIR_VISION = "/kaggle/input/datasets/anaghachoudhari/pcos-detection-using-ultrasound-images/data"
-DATA_DIR_TABULAR = "/kaggle/input/polycystic-ovary-syndrome-pcos"
+DATA_DIR_TABULAR = "/kaggle/input/datasets/prasoonkottarathil/polycystic-ovary-syndrome-pcos"
 
 CNN_MODEL_PATH = "cnn_agent_best.h5"
 LAST_CONV_LAYER = "efficientnetb0"
