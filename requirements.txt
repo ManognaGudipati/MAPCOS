@@ -8,3 +8,4 @@ neo4j
 matplotlib
 scikit-image
 scipy
+openpyxl
