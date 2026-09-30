@@ -43,3 +43,26 @@ GROUNDING_PARAMS = {
     "heatmap_threshold": 0.5,      # Grad-CAM value above which a pixel counts as "CNN attention"
     "iou_agreement_threshold": 0.15,  # IoU rarely gets high here — Grad-CAM is diffuse, follicles are small circles
 }
+# Tabular data — Lab & Symptoms agents
+TABULAR_XLSX_PATH = f"{DATA_DIR_TABULAR}/PCOS_data_without_infertility.xlsx"
+TABULAR_SHEET_NAME = "Full_new"
+TARGET_COLUMN = "PCOS (Y/N)"
+
+LAB_MODEL_PATH = "lab_agent_xgb.json"
+SYMPTOMS_MODEL_PATH = "symptoms_agent_xgb.json"
+
+# Real column names in PCOS_data_without_infertility.xlsx, sheet "Full_new"
+LAB_RAW_COLUMNS = {
+    "fsh": "FSH(mIU/mL)",
+    "lh": "LH(mIU/mL)",
+    "amh": "AMH(ng/mL)",
+}
+SYMPTOMS_RAW_COLUMNS = {
+    "bmi": "BMI",
+    "cycle_code": "Cycle(R/I)",        # 2 = Regular; anything else (4, or a stray 5) = Irregular
+    "hair_growth": "hair growth(Y/N)",
+    "weight_gain": "Weight gain(Y/N)",
+    "skin_darkening": "Skin darkening (Y/N)",
+    "hair_loss": "Hair loss(Y/N)",
+    "pimples": "Pimples(Y/N)",
+}
