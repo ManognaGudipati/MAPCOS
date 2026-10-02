@@ -10,7 +10,8 @@ downloaded on first use):
     !python -m mapcos.training.compare_cnns
 
 Selection rule: the model with the highest F1 on the VALIDATION split wins
-(ties broken by AUC). Test-set metrics are reported for all three models, so
+(ties broken by AUC, then log loss). Corrupt images are skipped automatically.
+Test-set metrics are reported for all three models, so
 the winner's test numbers are an unbiased estimate of its performance.
 """
 
@@ -18,11 +19,13 @@ import gc
 import json
 import os
 import shutil
+import tempfile
 
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
+from PIL import Image
+from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score, log_loss,
                              precision_score, recall_score, roc_auc_score)
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras import layers, models
@@ -52,6 +55,38 @@ CANDIDATES = {
 # output is P(infected), which is what CNNClassificationAgent assumes.
 CLASSES = ["notinfected", "infected"]
 OUT_DIR = "cnn_comparison"
+
+
+def make_clean_copy(data_dir, out_root=None):
+    """Kaggle input is read-only, so unreadable/corrupt images cannot be deleted.
+    Instead, build a folder of symlinks that only contains images PIL can fully
+    decode, and train/evaluate from that."""
+    out_root = out_root or os.path.join(tempfile.gettempdir(), "pcos_clean")
+    shutil.rmtree(out_root, ignore_errors=True)
+    bad, good = [], 0
+    for split in ("train", "test"):
+        for cls in CLASSES:
+            src_dir = os.path.join(data_dir, split, cls)
+            dst_dir = os.path.join(out_root, split, cls)
+            os.makedirs(dst_dir, exist_ok=True)
+            for fname in sorted(os.listdir(src_dir)):
+                src = os.path.join(src_dir, fname)
+                try:
+                    with Image.open(src) as im:
+                        im.load()
+                except Exception:
+                    bad.append(src)
+                    continue
+                dst = os.path.join(dst_dir, fname)
+                try:
+                    os.symlink(src, dst)
+                except OSError:
+                    shutil.copy2(src, dst)
+                good += 1
+    print(f"Clean dataset: {good} readable images, {len(bad)} skipped")
+    for b in bad:
+        print("  skipped unreadable file:", b)
+    return out_root
 
 
 def build_data_generators(data_dir):
@@ -139,6 +174,7 @@ def evaluate(model, gen, threshold=0.5):
         "f1": f1_score(y_true, y_pred, zero_division=0),
         "specificity": tn / (tn + fp) if (tn + fp) else 0.0,
         "auc": roc_auc_score(y_true, probs) if len(set(y_true)) > 1 else float("nan"),
+        "log_loss": log_loss(y_true, np.clip(probs, 1e-7, 1 - 1e-7), labels=[0, 1]),
         "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
     }
 
@@ -159,9 +195,11 @@ def plot_comparison(test_df, path):
 
 
 def main(model_names=None, data_dir=DATA_DIR_VISION, weights="imagenet",
-         head_epochs=15, finetune_epochs=10, out_dir=OUT_DIR):
+         head_epochs=15, finetune_epochs=10, out_dir=OUT_DIR, clean_data=True):
     model_names = model_names or list(CANDIDATES)
     os.makedirs(out_dir, exist_ok=True)
+    if clean_data:
+        data_dir = make_clean_copy(data_dir)
 
     train_gen, val_gen, test_gen = build_data_generators(data_dir)
     print("Class indices:", train_gen.class_indices, "(1 = infected = positive class)")
@@ -176,16 +214,16 @@ def main(model_names=None, data_dir=DATA_DIR_VISION, weights="imagenet",
         print(f"\n{'=' * 20} Training {name} {'=' * 20}")
         model = train_one(name, train_gen, val_gen, class_weight, weights,
                           head_epochs, finetune_epochs)
+        model.save(os.path.join(out_dir, f"{name}.h5"))   # save first, evaluate after
         val_rows[name] = evaluate(model, val_gen)
         test_rows[name] = evaluate(model, test_gen)
-        model.save(os.path.join(out_dir, f"{name}.h5"))
         del model
         tf.keras.backend.clear_session()
         gc.collect()
 
     val_df = pd.DataFrame(val_rows).T
     test_df = pd.DataFrame(test_rows).T
-    shown = ["accuracy", "precision", "recall", "f1", "specificity", "auc"]
+    shown = ["accuracy", "precision", "recall", "f1", "specificity", "auc", "log_loss"]
 
     pd.set_option("display.width", 200)
     print("\nVALIDATION metrics (used to pick the winner)")
@@ -195,9 +233,11 @@ def main(model_names=None, data_dir=DATA_DIR_VISION, weights="imagenet",
     print("\nTEST confusion counts (positive = infected)")
     print(test_df[["tn", "fp", "fn", "tp"]].astype(int))
 
-    # Winner = best validation F1, ties broken by validation AUC
-    best = val_df.sort_values(["f1", "auc"], ascending=False).index[0]
-    print(f"\n>>> Best CNN (highest validation F1): {best}")
+    # Winner = best validation F1; ties broken by validation AUC, then lowest log loss
+    ranked = val_df.assign(neg_log_loss=-val_df["log_loss"]).sort_values(
+        ["f1", "auc", "neg_log_loss"], ascending=False)
+    best = ranked.index[0]
+    print(f"\n>>> Best CNN (highest validation F1, then AUC, then log loss): {best}")
 
     val_df.to_csv(os.path.join(out_dir, "validation_metrics.csv"))
     test_df.to_csv(os.path.join(out_dir, "test_metrics.csv"))
