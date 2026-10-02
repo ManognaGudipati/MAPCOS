@@ -1,96 +1,214 @@
 """
-Trains the EfficientNetB0 backbone used by CNNClassificationAgent.
-Run this once, in a Kaggle Notebook with a GPU turned on, to produce
-cnn_agent_best.h5, then point CNNClassificationAgent at that file.
+Trains three CNN backbones on the PCOS ultrasound dataset, compares them on
+accuracy / precision / recall / F1 / specificity (+ AUC), picks the best one
+and saves it as CNN_MODEL_PATH so the rest of MAPCOS (CNNClassificationAgent,
+Grad-CAM, orchestrator) can use it unchanged.
 
-Run: python -m mapcos.training.train_cnn
+Run in a Kaggle notebook with a GPU and Internet ON (the ImageNet weights are
+downloaded on first use):
+
+    !python -m mapcos.training.compare_cnns
+
+Selection rule: the model with the highest F1 on the VALIDATION split wins
+(ties broken by AUC). Test-set metrics are reported for all three models, so
+the winner's test numbers are an unbiased estimate of its performance.
 """
 
+import gc
+import json
+import os
+import shutil
+
+import numpy as np
+import pandas as pd
 import tensorflow as tf
+from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
+                             precision_score, recall_score, roc_auc_score)
+from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras import layers, models
-from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.applications import DenseNet121, EfficientNetB0, MobileNetV2
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
-from mapcos.config import IMG_SIZE, BATCH_SIZE, DATA_DIR_VISION, CNN_MODEL_PATH
+from mapcos.config import BATCH_SIZE, CNN_MODEL_PATH, DATA_DIR_VISION, IMG_SIZE
 
-TRAIN_DIR = f"{DATA_DIR_VISION}/train"
-TEST_DIR = f"{DATA_DIR_VISION}/test"
+# The generators feed images scaled to [0, 1] (same as CNNClassificationAgent).
+# Each backbone below starts with the layer(s) that convert [0, 1] into the
+# range that backbone's ImageNet weights expect. Putting this INSIDE the model
+# keeps the agent and Grad-CAM code unchanged for whichever CNN wins.
+#   EfficientNetB0 expects raw 0-255 (it normalises internally)
+#   MobileNetV2    expects [-1, 1]
+#   DenseNet121    expects ImageNet mean/std normalisation
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_VAR = [0.229 ** 2, 0.224 ** 2, 0.225 ** 2]
+
+CANDIDATES = {
+    "EfficientNetB0": (EfficientNetB0, lambda: layers.Rescaling(255.0)),
+    "DenseNet121": (DenseNet121,
+                    lambda: layers.Normalization(mean=IMAGENET_MEAN, variance=IMAGENET_VAR)),
+    "MobileNetV2": (MobileNetV2, lambda: layers.Rescaling(2.0, offset=-1.0)),
+}
+
+# Class order matters: index 1 must be the positive (PCOS) class so the sigmoid
+# output is P(infected), which is what CNNClassificationAgent assumes.
+CLASSES = ["notinfected", "infected"]
+OUT_DIR = "cnn_comparison"
 
 
-def build_data_generators():
-    train_datagen = ImageDataGenerator(
-        rescale=1. / 255, rotation_range=15, zoom_range=0.1,
-        horizontal_flip=True, validation_split=0.15
-    )
-    test_datagen = ImageDataGenerator(rescale=1. / 255)
+def build_data_generators(data_dir):
+    train_dir, test_dir = f"{data_dir}/train", f"{data_dir}/test"
+    common = dict(target_size=(IMG_SIZE, IMG_SIZE), batch_size=BATCH_SIZE,
+                  class_mode="binary", classes=CLASSES, color_mode="rgb")
 
-    train_gen = train_datagen.flow_from_directory(
-        TRAIN_DIR, target_size=(IMG_SIZE, IMG_SIZE), batch_size=BATCH_SIZE,
-        class_mode="binary", subset="training", color_mode="rgb"
-    )
-    val_gen = train_datagen.flow_from_directory(
-        TRAIN_DIR, target_size=(IMG_SIZE, IMG_SIZE), batch_size=BATCH_SIZE,
-        class_mode="binary", subset="validation", color_mode="rgb"
-    )
-    test_gen = test_datagen.flow_from_directory(
-        TEST_DIR, target_size=(IMG_SIZE, IMG_SIZE), batch_size=BATCH_SIZE,
-        class_mode="binary", shuffle=False, color_mode="rgb"
-    )
+    aug = ImageDataGenerator(rescale=1. / 255, rotation_range=15, zoom_range=0.1,
+                             horizontal_flip=True, validation_split=0.15)
+    plain = ImageDataGenerator(rescale=1. / 255, validation_split=0.15)
+    test_plain = ImageDataGenerator(rescale=1. / 255)
+
+    train_gen = aug.flow_from_directory(train_dir, subset="training", seed=42, **common)
+    # Same 15% split as before, but no augmentation and no shuffling, so the
+    # validation metrics are stable and comparable between models.
+    val_gen = plain.flow_from_directory(train_dir, subset="validation", shuffle=False, **common)
+    test_gen = test_plain.flow_from_directory(test_dir, shuffle=False, **common)
     return train_gen, val_gen, test_gen
 
 
-def build_cnn_model():
-    base = EfficientNetB0(include_top=False, weights="imagenet",
-                           input_shape=(IMG_SIZE, IMG_SIZE, 3))
+def build_model(name, weights="imagenet"):
+    backbone_cls, preprocess = CANDIDATES[name]
+    base = backbone_cls(include_top=False, weights=weights,
+                        input_shape=(IMG_SIZE, IMG_SIZE, 3))
     base.trainable = False
 
+    # Wrapper named "backbone" = preprocessing + pretrained CNN. This is the
+    # layer Grad-CAM looks up (LAST_CONV_LAYER in config.py).
+    inp = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+    x = preprocess()(inp)
+    x = base(x)
+    backbone = models.Model(inp, x, name="backbone")
+
     inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
-    x = base(inputs, training=False)
+    x = backbone(inputs, training=False)
     x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dropout(0.3)(x)
     x = layers.Dense(128, activation="relu")(x)
     x = layers.Dropout(0.2)(x)
     outputs = layers.Dense(1, activation="sigmoid")(x)
-
-    model = models.Model(inputs, outputs)
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-4),
-        loss="binary_crossentropy",
-        metrics=["accuracy", tf.keras.metrics.AUC(name="auc")]
-    )
-    return model, base
+    return models.Model(inputs, outputs, name=name), base
 
 
-def main():
-    train_gen, val_gen, _ = build_data_generators()
-    model, base = build_cnn_model()
-    model.summary()
+def _compile(model, lr):
+    model.compile(optimizer=tf.keras.optimizers.Adam(lr), loss="binary_crossentropy",
+                  metrics=["accuracy", tf.keras.metrics.AUC(name="auc")])
 
-    early_stop = tf.keras.callbacks.EarlyStopping(
-        monitor="val_auc", mode="max", patience=5, restore_best_weights=True
-    )
-    checkpoint = tf.keras.callbacks.ModelCheckpoint(
-        CNN_MODEL_PATH, monitor="val_auc", mode="max", save_best_only=True
-    )
 
-    # Phase 1: train the classification head only
-    model.fit(train_gen, validation_data=val_gen, epochs=15,
-              callbacks=[early_stop, checkpoint])
+def _callbacks():
+    # New callback objects per phase so early-stopping state is not carried over.
+    return [tf.keras.callbacks.EarlyStopping(monitor="val_auc", mode="max", patience=5,
+                                             restore_best_weights=True)]
 
-    # Phase 2: unfreeze the top of the backbone, fine-tune at a low LR
-    base.trainable = True
-    for layer in base.layers[:-30]:
-        layer.trainable = False
 
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-5),
-        loss="binary_crossentropy",
-        metrics=["accuracy", tf.keras.metrics.AUC(name="auc")]
-    )
-    model.fit(train_gen, validation_data=val_gen, epochs=10,
-              callbacks=[early_stop, checkpoint])
+def train_one(name, train_gen, val_gen, class_weight, weights, head_epochs, finetune_epochs):
+    model, base = build_model(name, weights)
+    # Phase 1: train the new classification head only
+    _compile(model, 1e-4)
+    model.fit(train_gen, validation_data=val_gen, epochs=head_epochs,
+              class_weight=class_weight, callbacks=_callbacks(), verbose=2)
 
-    print(f"Best model saved to {CNN_MODEL_PATH}")
+    # Phase 2: unfreeze the top 30 layers of the backbone, fine-tune at a low LR
+    if finetune_epochs > 0:
+        base.trainable = True
+        for layer in base.layers[:-30]:
+            layer.trainable = False
+        _compile(model, 1e-5)
+        model.fit(train_gen, validation_data=val_gen, epochs=finetune_epochs,
+                  class_weight=class_weight, callbacks=_callbacks(), verbose=2)
+    return model
+
+
+def evaluate(model, gen, threshold=0.5):
+    """Metrics with 'infected' (PCOS) as the positive class."""
+    gen.reset()
+    probs = model.predict(gen, verbose=0).ravel()
+    y_true = gen.classes.astype(int)
+    y_pred = (probs >= threshold).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "recall": recall_score(y_true, y_pred, zero_division=0),   # sensitivity
+        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "specificity": tn / (tn + fp) if (tn + fp) else 0.0,
+        "auc": roc_auc_score(y_true, probs) if len(set(y_true)) > 1 else float("nan"),
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+    }
+
+
+def plot_comparison(test_df, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    metrics = ["accuracy", "precision", "recall", "f1", "specificity"]
+    ax = test_df[metrics].plot(kind="bar", figsize=(9, 4.5), ylim=(0, 1), rot=0)
+    ax.set_title("CNN comparison on the test set")
+    ax.set_ylabel("score")
+    ax.legend(loc="lower right")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def main(model_names=None, data_dir=DATA_DIR_VISION, weights="imagenet",
+         head_epochs=15, finetune_epochs=10, out_dir=OUT_DIR):
+    model_names = model_names or list(CANDIDATES)
+    os.makedirs(out_dir, exist_ok=True)
+
+    train_gen, val_gen, test_gen = build_data_generators(data_dir)
+    print("Class indices:", train_gen.class_indices, "(1 = infected = positive class)")
+
+    classes = np.unique(train_gen.classes)
+    cw = compute_class_weight("balanced", classes=classes, y=train_gen.classes)
+    class_weight = {int(c): float(w) for c, w in zip(classes, cw)}
+    print("Class weights:", class_weight)
+
+    val_rows, test_rows = {}, {}
+    for name in model_names:
+        print(f"\n{'=' * 20} Training {name} {'=' * 20}")
+        model = train_one(name, train_gen, val_gen, class_weight, weights,
+                          head_epochs, finetune_epochs)
+        val_rows[name] = evaluate(model, val_gen)
+        test_rows[name] = evaluate(model, test_gen)
+        model.save(os.path.join(out_dir, f"{name}.h5"))
+        del model
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+    val_df = pd.DataFrame(val_rows).T
+    test_df = pd.DataFrame(test_rows).T
+    shown = ["accuracy", "precision", "recall", "f1", "specificity", "auc"]
+
+    pd.set_option("display.width", 200)
+    print("\nVALIDATION metrics (used to pick the winner)")
+    print(val_df[shown].round(4))
+    print("\nTEST metrics")
+    print(test_df[shown].round(4))
+    print("\nTEST confusion counts (positive = infected)")
+    print(test_df[["tn", "fp", "fn", "tp"]].astype(int))
+
+    # Winner = best validation F1, ties broken by validation AUC
+    best = val_df.sort_values(["f1", "auc"], ascending=False).index[0]
+    print(f"\n>>> Best CNN (highest validation F1): {best}")
+
+    val_df.to_csv(os.path.join(out_dir, "validation_metrics.csv"))
+    test_df.to_csv(os.path.join(out_dir, "test_metrics.csv"))
+    plot_comparison(test_df, os.path.join(out_dir, "test_comparison.png"))
+    with open(os.path.join(out_dir, "best_cnn.json"), "w") as f:
+        json.dump({"best_model": best, "selected_by": "validation F1",
+                   "test_metrics": {k: float(v) for k, v in test_df.loc[best].items()}}, f, indent=2)
+
+    shutil.copy(os.path.join(out_dir, f"{best}.h5"), CNN_MODEL_PATH)
+    print(f"Best model copied to {CNN_MODEL_PATH}")
+    return best, val_df, test_df
 
 
 if __name__ == "__main__":
